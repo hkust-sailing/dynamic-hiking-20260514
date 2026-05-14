@@ -191,7 +191,9 @@ def run_mode(position_interval: float = 0.1, position_path: str = DEFAULT_RT_PAT
 		controller.connect()
 		ensure_platform_ready(controller)
 
-		log_path = Path(__file__).resolve().parents[2] / f"{Path(position_path).stem}_rt_feedback_{int(time.time())}.csv"
+		feedback_dir = Path(__file__).resolve().parents[2] / "feedback"
+		feedback_dir.mkdir(parents=True, exist_ok=True)
+		log_path = feedback_dir / f"{Path(position_path).stem}_rt_feedback_{int(time.time())}.csv"
 		logger = FeedbackLogger(log_path)
 		feedback_monitor = FeedbackMonitor(controller, stop_event)
 		feedback_monitor.start()
