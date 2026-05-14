@@ -1,6 +1,8 @@
 import threading
 import time
 import csv
+import math
+import queue
 from pathlib import Path
 
 from Controller.command_message import CommandCodes, CommandMessage, SubCommandCodes
@@ -18,6 +20,77 @@ DEFAULT_RT_PATH = "data/wave/ocean_waves_extract.txt"
 
 # If needed, change this constant for repeated execution.
 LOOP_SEQUENCE = False
+
+
+class FeedbackLogger:
+	def __init__(self, path: Path):
+		self._queue: queue.Queue = queue.Queue(maxsize=2048)
+		self._file = path.open("w", newline="", encoding="utf-8")
+		self._writer = csv.writer(self._file)
+		self._writer.writerow(
+			[
+				"time_s",
+				"cmd_x",
+				"cmd_y",
+				"cmd_z",
+				"cmd_roll",
+				"cmd_pitch",
+				"cmd_yaw",
+				"fb_x",
+				"fb_y",
+				"fb_z",
+				"fb_roll",
+				"fb_pitch",
+				"fb_yaw",
+			]
+		)
+		self._thread = threading.Thread(target=self._writer_loop, daemon=True)
+		self._thread.start()
+
+	def log(self, row: list[float]) -> None:
+		try:
+			self._queue.put_nowait(row)
+		except queue.Full:
+			print("Warning: feedback log queue full; dropping a record")
+
+	def close(self) -> None:
+		self._queue.put(None)
+		self._thread.join(timeout=1.0)
+		self._file.close()
+
+	def _writer_loop(self) -> None:
+		while True:
+			item = self._queue.get()
+			if item is None:
+				break
+			self._writer.writerow(item)
+			self._file.flush()
+
+
+class FeedbackMonitor:
+	def __init__(self, controller, stop_event: threading.Event):
+		self._controller = controller
+		self._stop_event = stop_event
+		self._lock = threading.Lock()
+		self._latest = None
+		self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+
+	def start(self) -> None:
+		self._thread.start()
+
+	def latest(self):
+		with self._lock:
+			return self._latest
+
+	def join(self, timeout: float = 0.5) -> None:
+		self._thread.join(timeout=timeout)
+
+	def _monitor_loop(self) -> None:
+		while not self._stop_event.is_set():
+			feedback = self._controller.get_feedback()
+			if feedback is not None:
+				with self._lock:
+					self._latest = feedback
 
 
 def _resolve_position_path(position_path: str) -> Path:
@@ -112,18 +185,26 @@ def run_mode(position_interval: float = 0.1, position_path: str = DEFAULT_RT_PAT
 		daemon=True,
 	)
 
+	logger = None
+	feedback_monitor = None
 	try:
 		controller.connect()
 		ensure_platform_ready(controller)
+
+		log_path = Path(__file__).resolve().parents[2] / f"{Path(position_path).stem}_rt_feedback_{int(time.time())}.csv"
+		logger = FeedbackLogger(log_path)
+		feedback_monitor = FeedbackMonitor(controller, stop_event)
+		feedback_monitor.start()
 		keyboard_thread.start()
 
 		sequence_count = 0
+		sequence_real_start = time.time()
 		while not stop_event.is_set():
 			sequence_count += 1
 			print(f"Running position sequence #{sequence_count} ({len(positions)} points)")
 			
 			# Record the start time for this sequence to enable absolute timing
-			sequence_start_time = time.time()
+			sequence_start_time = time.monotonic()
 			total_pause_duration = 0.0
 
 			for point_index, dofs in enumerate(positions, start=1):
@@ -134,18 +215,16 @@ def run_mode(position_interval: float = 0.1, position_path: str = DEFAULT_RT_PAT
 				pause_start_time = None
 				while state["paused"] and not stop_event.is_set():
 					if pause_start_time is None:
-						pause_start_time = time.time()
+						pause_start_time = time.monotonic()
 					time.sleep(0.05)
-				
-				# Accumulate pause duration so far in this sequence
+
 				if pause_start_time is not None:
-					total_pause_duration += time.time() - pause_start_time
+					total_pause_duration += time.monotonic() - pause_start_time
 
 				# Calculate the scheduled send time for this point using absolute timing
 				# This accounts for command execution time and prevents drift
 				scheduled_time = sequence_start_time + (point_index - 1) * position_interval + total_pause_duration
-				
-				# Send the command
+
 				command = CommandMessage(
 					command_code=CommandCodes.CommandMoving,
 					sub_command_code=SubCommandCodes.Step,
@@ -153,10 +232,37 @@ def run_mode(position_interval: float = 0.1, position_path: str = DEFAULT_RT_PAT
 				)
 				controller.send_command(command)
 				print(f"Sent point {point_index}: {dofs}")
-				
-				# Sleep only the remaining time needed to reach the scheduled time
-				# This naturally accounts for command execution and communication delays
-				current_time = time.time()
+
+				feedback = feedback_monitor.latest() if feedback_monitor is not None else None
+				if feedback is None:
+					fb_values = [math.nan] * 6
+					print(f"Warning: no feedback available for point {point_index}, recording NaN values")
+				else:
+					fb_values = list(feedback.AttitudesArray[:6])
+
+				command_values = [
+					dofs[3],
+					dofs[4],
+					dofs[5],
+					dofs[0],
+					dofs[1],
+					dofs[2],
+				]
+				feedback_record = [
+					fb_values[3],
+					fb_values[4],
+					fb_values[5],
+					fb_values[0],
+					fb_values[1],
+					fb_values[2],
+				]
+				logger.log([
+					time.time() - sequence_real_start,
+					*command_values,
+					*feedback_record,
+				])
+
+				current_time = time.monotonic()
 				time_until_next = scheduled_time - current_time
 				if time_until_next > 0:
 					time.sleep(time_until_next)
@@ -164,6 +270,14 @@ def run_mode(position_interval: float = 0.1, position_path: str = DEFAULT_RT_PAT
 			if not LOOP_SEQUENCE:
 				break
 	finally:
+		stop_event.set()
+		if keyboard_thread.is_alive():
+			keyboard_thread.join(timeout=0.2)
+		if feedback_monitor is not None:
+			feedback_monitor.join(timeout=0.5)
+		if logger is not None:
+			logger.close()
+		controller.dispose()
 		stop_event.set()
 		if keyboard_thread.is_alive():
 			keyboard_thread.join(timeout=0.2)
