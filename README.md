@@ -2,12 +2,8 @@
 Python == 3.12.9
 
 If you use conda, follows:
-`conda create -n stewart python==3.9.12`
-
-`conda activate stewart`
-
-`pip install -r requirements.txt`
-
+`conda env create -f environment.yml`
+`conda activate stewart_v3`
 
 ## point_move
 1. base
