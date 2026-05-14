@@ -121,14 +121,31 @@ def run_mode(position_interval: float = 0.1, position_path: str = DEFAULT_RT_PAT
 		while not stop_event.is_set():
 			sequence_count += 1
 			print(f"Running position sequence #{sequence_count} ({len(positions)} points)")
+			
+			# Record the start time for this sequence to enable absolute timing
+			sequence_start_time = time.time()
+			total_pause_duration = 0.0
 
 			for point_index, dofs in enumerate(positions, start=1):
 				if stop_event.is_set():
 					break
 
+				# Handle pause/resume, tracking accumulated pause duration
+				pause_start_time = None
 				while state["paused"] and not stop_event.is_set():
+					if pause_start_time is None:
+						pause_start_time = time.time()
 					time.sleep(0.05)
+				
+				# Accumulate pause duration so far in this sequence
+				if pause_start_time is not None:
+					total_pause_duration += time.time() - pause_start_time
 
+				# Calculate the scheduled send time for this point using absolute timing
+				# This accounts for command execution time and prevents drift
+				scheduled_time = sequence_start_time + (point_index - 1) * position_interval + total_pause_duration
+				
+				# Send the command
 				command = CommandMessage(
 					command_code=CommandCodes.CommandMoving,
 					sub_command_code=SubCommandCodes.Step,
@@ -136,7 +153,13 @@ def run_mode(position_interval: float = 0.1, position_path: str = DEFAULT_RT_PAT
 				)
 				controller.send_command(command)
 				print(f"Sent point {point_index}: {dofs}")
-				time.sleep(position_interval)
+				
+				# Sleep only the remaining time needed to reach the scheduled time
+				# This naturally accounts for command execution and communication delays
+				current_time = time.time()
+				time_until_next = scheduled_time - current_time
+				if time_until_next > 0:
+					time.sleep(time_until_next)
 
 			if not LOOP_SEQUENCE:
 				break
